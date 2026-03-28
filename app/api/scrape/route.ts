@@ -23,12 +23,85 @@ export async function POST(req: Request) {
 
     const page = await context.newPage();
     
-    // Go to the URL
+    // 1. Acessa a página normalmente para a VTEX inicializar a sessão padrão
     console.log(`Acessando a URL fornecida: ${url}`);
     await page.goto(url, { waitUntil: 'load', timeout: 60000 });
-    
-    // Wait for any client-side redirects or initial rendering to finish
     await page.waitForTimeout(3000);
+
+    // 2. Força a regionalização usando a API oficial da VTEX + Cookies + LocalStorage
+    console.log('Aplicando regionalização (API de Sessão + Cookie + LocalStorage)...');
+    
+    const segmentValue = 'eyJjYW1wYWlnbnMiOm51bGwsImNoYW5uZWwiOiIxIiwicHJpY2VUYWJsZXMiOm51bGwsInJlZ2lvbklkIjoiVTFjamMyRnRjMk5zZFdJME5qYzRPM05oYlhOamJIVmlOakExT0E9PSIsInV0bV9jYW1wYWlnbiI6bnVsbCwidXRtX3NvdXJjZSI6bnVsbCwidXRtaV9jYW1wYWlnbiI6bnVsbCwiY3VycmVuY3lDb2RlIjoiQlJMIiwiY3VycmVuY3lTeW1ib2wiOiJSJCIsImNvdW50cnlDb2RlIjoiQlJBIiwiY3VsdHVyZUluZm8iOiJwdC1CUiIsImNoYW5uZWxQcml2YWN5IjoicHVibGljIn0';
+    // O regionId foi extraído decodificando o base64 do segmentValue acima
+    const regionId = "U1cjc2Ftc2NsdWI0Njc4O3NhbXNjbHViNjA1OA==";
+
+    // A. Atualiza os cookies no contexto do navegador
+    await context.addCookies([
+      { name: 'vtex_segment', value: segmentValue, domain: '.samsclub.com.br', path: '/' },
+      { name: 'vtex_segment', value: segmentValue, domain: 'www.samsclub.com.br', path: '/' }
+    ]);
+
+    // B. Executa no contexto da página: LocalStorage + Chamada de API
+    await page.evaluate(async (data) => {
+      // Força no LocalStorage
+      window.localStorage.setItem('vtex_segment', data.segmentValue);
+      
+      // Chama a API de sessão da VTEX para registrar a região no backend deles
+      try {
+        await fetch('/api/sessions/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            public: {
+              regionId: { value: data.regionId }
+            }
+          })
+        });
+      } catch (e) {
+        console.error('Erro na API de sessions:', e);
+      }
+    }, { segmentValue, regionId });
+
+    // 3. Recarrega a página para que a VTEX consuma a nova sessão
+    console.log('Recarregando a página com a nova localidade...');
+    await page.reload({ waitUntil: 'load', timeout: 60000 });
+    await page.waitForTimeout(5000);
+
+    // --- Extração da Localidade (Validação do Cookie) ---
+    let locationText = 'Localidade não identificada';
+    try {
+      console.log('Extraindo localidade do cabeçalho...');
+      locationText = await page.evaluate(() => {
+        const elements = Array.from(document.querySelectorAll('*'));
+        let bestMatch = '';
+        
+        for (const el of elements) {
+          // Apenas elementos que contêm texto direto (ignora containers pais gigantes)
+          const hasDirectText = Array.from(el.childNodes).some(
+            node => node.nodeType === Node.TEXT_NODE && (node.textContent?.trim().length || 0) > 0
+          );
+          if (!hasDirectText) continue;
+
+          const text = el.textContent?.replace(/\s+/g, ' ').trim() || '';
+          
+          // Verifica se o texto contém "Sam's Club" e não é muito longo
+          if (text.toLowerCase().includes("sam's club") && text.length < 60) {
+            const rect = el.getBoundingClientRect();
+            // Garante que o elemento está no topo da página e é visível
+            if (rect.top >= 0 && rect.top < 300 && rect.width > 0 && rect.height > 0) {
+              if (!bestMatch || text.length < bestMatch.length) {
+                bestMatch = text;
+              }
+            }
+          }
+        }
+        return bestMatch || 'Localidade não encontrada no topo da página';
+      });
+      console.log(`Localidade detectada: ${locationText}`);
+    } catch (e) {
+      console.error('Erro ao extrair localidade:', e);
+    }
+    // ----------------------------------------------------
 
     let retries = 0;
     const maxRetries = 3; 
@@ -144,7 +217,7 @@ export async function POST(req: Request) {
       }
     }
 
-    return NextResponse.json({ data: Array.from(uniqueProductsMap.values()) });
+    return NextResponse.json({ data: Array.from(uniqueProductsMap.values()), location: locationText });
   } catch (error: any) {
     console.error('Scraping error:', error);
     return NextResponse.json({ error: error.message || 'Failed to scrape data' }, { status: 500 });

@@ -103,49 +103,112 @@ export async function POST(req: Request) {
     }
     // ----------------------------------------------------
 
-    let retries = 0;
-    const maxRetries = 3; 
-    const maxScrolls = 200; // Safety limit
-    let scrollCount = 0;
-    const scrollDistance = 500;
+    // --- Lógica de Paginação (Clicar em "Ver Mais") ---
+    console.log('Iniciando carregamento de todas as páginas...');
+    let hasMore = true;
+    let clickCount = 0;
+    const maxClicks = 100; // Limite de segurança para evitar loops infinitos
 
-    // Scroll to the bottom of the page
-    while (retries < maxRetries && scrollCount < maxScrolls) {
-      try {
-        const previousScrollY = await page.evaluate(() => window.scrollY);
-        await page.evaluate((dist) => window.scrollBy(0, dist), scrollDistance);
-        
-        await page.waitForTimeout(500);
-        
-        const currentScrollY = await page.evaluate(() => window.scrollY);
-        const windowHeight = await page.evaluate(() => window.innerHeight);
-        const documentHeight = await page.evaluate(() => document.body.scrollHeight);
-        
-        if (currentScrollY === previousScrollY || currentScrollY + windowHeight >= documentHeight) {
-          retries++;
-          // Try a small scroll up to trigger observers
-          await page.evaluate(() => window.scrollBy(0, -300));
-          await page.waitForTimeout(500);
-          await page.evaluate(() => window.scrollBy(0, 500));
-          await page.waitForTimeout(500);
-        } else {
-          retries = 0;
-        }
-      } catch (err: any) {
-        if (err.message.includes('Execution context was destroyed') || err.message.includes('Target closed')) {
-          console.warn('Navigation detected during scroll, waiting for page to stabilize...');
-          await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
-          await page.waitForTimeout(2000);
-        } else {
-          throw err;
-        }
+    while (hasMore && clickCount < maxClicks) {
+      // Rola para baixo em incrementos para acionar o lazy load e encontrar o botão
+      let foundButton = false;
+      for (let i = 0; i < 15; i++) { // Tenta rolar até 15 vezes procurando o botão
+        await page.evaluate(() => window.scrollBy(0, 800));
+        await page.waitForTimeout(1000);
+
+        foundButton = await page.evaluate(() => {
+          const elements = Array.from(document.querySelectorAll('button, a, div'));
+          const btn = elements.find(el => {
+            const htmlEl = el as HTMLElement;
+            // Ignora elementos muito grandes (containers)
+            if (htmlEl.clientHeight > 150 || htmlEl.clientWidth > 800) return false;
+            
+            const text = (htmlEl.innerText || htmlEl.textContent || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            return (text.includes('mostrar mais') || text.includes('ver mais') || text.includes('carregar mais')) 
+                   && htmlEl.offsetParent !== null; // Verifica se está visível
+          });
+
+          if (btn) {
+            btn.scrollIntoView({ block: 'center' });
+            return true;
+          }
+          return false;
+        });
+
+        if (foundButton) break;
       }
-      
-      scrollCount++;
+
+      if (foundButton) {
+        console.log(`Clicando no botão "Ver Mais" (Clique #${clickCount + 1})...`);
+        try {
+          // Clica via JS para ignorar overlays (banners, modais de cookies, etc)
+          await page.evaluate(() => {
+            const elements = Array.from(document.querySelectorAll('button, a, div'));
+            const btn = elements.find(el => {
+              const htmlEl = el as HTMLElement;
+              if (htmlEl.clientHeight > 150 || htmlEl.clientWidth > 800) return false;
+              const text = (htmlEl.innerText || htmlEl.textContent || '').toLowerCase().replace(/\s+/g, ' ').trim();
+              return (text.includes('mostrar mais') || text.includes('ver mais') || text.includes('carregar mais')) 
+                     && htmlEl.offsetParent !== null;
+            }) as HTMLElement;
+            
+            if (btn) btn.click();
+          });
+          
+          clickCount++;
+          
+          // Aguarda o carregamento dos novos itens (VTEX pode demorar)
+          await page.waitForTimeout(5000); 
+          
+          // Verifica e loga o progresso ("Mostrando X de Y")
+          const progress = await page.evaluate(() => {
+            const els = Array.from(document.querySelectorAll('span, div'));
+            const progEl = els.find(e => {
+              const htmlEl = e as HTMLElement;
+              if (htmlEl.clientHeight > 100) return false;
+              const t = (htmlEl.innerText || '').toLowerCase().replace(/\s+/g, ' ').trim();
+              return t.includes('mostrando') && t.includes('de');
+            });
+            return progEl ? (progEl as HTMLElement).innerText.replace(/\n/g, ' ').trim() : '';
+          });
+          if (progress) console.log(`Progresso atual: ${progress}`);
+
+        } catch (e) {
+          console.log('Erro ao clicar no botão:', e);
+          await page.waitForTimeout(2000);
+        }
+      } else {
+        console.log('Botão "Ver Mais" não encontrado após scroll. Fim da listagem alcançado.');
+        hasMore = false;
+      }
     }
 
-    // IMPORTANT: Mandatory 10 seconds delay after scrolling finishes
-    await page.waitForTimeout(10000);
+    // --- Scroll Final para Lazy Loading ---
+    // Após carregar todos os itens, fazemos um scroll suave do topo ao fim 
+    // para garantir que todas as imagens e preços (lazy loaded) sejam renderizados.
+    console.log('Fazendo scroll final para garantir renderização de todos os itens...');
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(1000);
+    
+    await page.evaluate(async () => {
+      await new Promise<void>((resolve) => {
+        let totalHeight = 0;
+        const distance = 600;
+        const timer = setInterval(() => {
+          const scrollHeight = document.body.scrollHeight;
+          window.scrollBy(0, distance);
+          totalHeight += distance;
+
+          if (totalHeight >= scrollHeight) {
+            clearInterval(timer);
+            resolve();
+          }
+        }, 300);
+      });
+    });
+
+    // Aguarda a renderização final dos últimos itens
+    await page.waitForTimeout(5000);
 
     // Extraction: Only after the delay
     const finalProducts = await page.evaluate(() => {

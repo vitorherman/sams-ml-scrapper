@@ -1,0 +1,5 @@
+{
+  "name": "Sam's Club Scraper",
+  "description": "Web scraping system for Sam's Club category URLs using Playwright.",
+  "requestFramePermissions": []
+}

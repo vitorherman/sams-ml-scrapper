@@ -1,12 +1,24 @@
 'use client';
 
 import { useState } from 'react';
-import { Loader2, Search, Download, MapPin } from 'lucide-react';
+import { Loader2, Search, Download, MapPin, ExternalLink, TrendingUp } from 'lucide-react';
+
+// Tipagem para suportar as colunas de comparação
+interface ProductResult {
+  produto: string;
+  valor: string;      // Preço Sam's (formatado)
+  link: string;       // Link Sam's
+  precoML?: string;   // Preço ML (formatado)
+  linkML?: string;    // Link da busca no ML
+  diferenca?: string; // Diferença em R$
+  variacao?: string;  // Variação em %
+  isLucro?: boolean;  // Para destacar em verde/vermelho
+}
 
 export default function Home() {
   const [url, setUrl] = useState('');
   const [loading, setLoading] = useState(false);
-  const [results, setResults] = useState<{ produto: string; valor: string; link: string }[] | null>(null);
+  const [results, setResults] = useState<ProductResult[] | null>(null);
   const [location, setLocation] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -22,17 +34,12 @@ export default function Home() {
     try {
       const response = await fetch('/api/scrape', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url }),
       });
 
       const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Falha ao buscar os dados');
-      }
+      if (!response.ok) throw new Error(data.error || 'Falha ao buscar os dados');
 
       setResults(data.data);
       setLocation(data.location);
@@ -50,7 +57,7 @@ export default function Home() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'sams-club-products.json';
+    a.download = 'arbitragem-sams-ml.json';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -59,11 +66,13 @@ export default function Home() {
 
   return (
     <main className="min-h-screen bg-neutral-950 p-8 font-sans text-neutral-100">
-      <div className="max-w-5xl mx-auto space-y-8">
+      <div className="max-w-7xl mx-auto space-y-8">
         <div className="space-y-2">
-          <h1 className="text-3xl font-bold tracking-tight">Sam&apos;s Club Scraper</h1>
+          <h1 className="text-3xl font-bold tracking-tight text-white flex items-center gap-3">
+            Sam&apos;s Club vs Mercado Livre
+          </h1>
           <p className="text-neutral-400">
-            Insira a URL de uma categoria do Sam&apos;s Club para extrair os produtos e preços.
+            Extração regionalizada com comparativo de arbitragem em tempo real.
           </p>
         </div>
 
@@ -77,15 +86,15 @@ export default function Home() {
                 type="url"
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
-                placeholder="https://www.samsclub.com.br/..."
-                className="block w-full pl-10 pr-3 py-3 bg-neutral-950 border border-neutral-800 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors text-white placeholder-neutral-600"
+                placeholder="Insira a URL da categoria do Sam's Club..."
+                className="block w-full pl-10 pr-3 py-3 bg-neutral-950 border border-neutral-800 rounded-lg focus:ring-2 focus:ring-blue-500 transition-colors text-white placeholder-neutral-600 font-medium"
                 required
               />
             </div>
             <button
               type="submit"
               disabled={loading}
-              className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+              className="bg-blue-600 hover:bg-blue-700 text-white px-8 py-3 rounded-lg font-bold transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 min-w-[220px]"
             >
               {loading ? (
                 <>
@@ -93,7 +102,7 @@ export default function Home() {
                   Extraindo...
                 </>
               ) : (
-                'Extrair Dados'
+                'Iniciar Arbitragem'
               )}
             </button>
           </form>
@@ -107,23 +116,22 @@ export default function Home() {
         {results && (
           <div className="space-y-4">
             {location && (
-              <div className="bg-blue-900/20 border border-blue-800/50 text-blue-300 px-4 py-3 rounded-lg flex items-center gap-2">
+              <div className="bg-blue-900/20 border border-blue-800/50 text-blue-300 px-4 py-3 rounded-lg flex items-center gap-2 w-fit">
                 <MapPin className="h-5 w-5 text-blue-400" />
-                <span className="font-medium">Localidade detectada:</span>
-                <span>{location}</span>
+                <span className="font-medium">Localidade: {location}</span>
               </div>
             )}
 
             <div className="flex justify-between items-center">
               <h2 className="text-xl font-semibold text-neutral-100">
-                Resultados ({results.length} produtos encontrados)
+                Oportunidades ({results.length} itens)
               </h2>
               <button
                 onClick={handleDownload}
                 className="flex items-center gap-2 text-sm font-medium text-neutral-300 hover:text-white bg-neutral-800 border border-neutral-700 px-4 py-2 rounded-lg transition-colors shadow-sm"
               >
                 <Download className="h-4 w-4" />
-                Baixar JSON
+                Exportar JSON
               </button>
             </div>
 
@@ -132,9 +140,12 @@ export default function Home() {
                 <table className="w-full text-left text-sm">
                   <thead className="bg-neutral-950 border-b border-neutral-800 text-neutral-400">
                     <tr>
-                      <th className="px-6 py-4 font-medium">Produto</th>
-                      <th className="px-6 py-4 font-medium w-32">Preço</th>
-                      <th className="px-6 py-4 font-medium w-24">Link</th>
+                      <th className="px-6 py-4 font-semibold uppercase text-[11px]">Produto</th>
+                      <th className="px-6 py-4 font-semibold uppercase text-[11px] text-center">Preço Sam&apos;s</th>
+                      <th className="px-6 py-4 font-semibold uppercase text-[11px] text-center">Preço ML</th>
+                      <th className="px-6 py-4 font-semibold uppercase text-[11px] text-center">Diferença R$</th>
+                      <th className="px-6 py-4 font-semibold uppercase text-[11px] text-center">Variação %</th>
+                      <th className="px-6 py-4 font-semibold uppercase text-[11px] text-center">Links</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-neutral-800">
@@ -143,32 +154,51 @@ export default function Home() {
                         <td className="px-6 py-4 font-medium text-neutral-200">
                           {item.produto}
                         </td>
-                        <td className="px-6 py-4 text-neutral-400 whitespace-nowrap">
+                        <td className="px-6 py-4 text-center text-neutral-300 whitespace-nowrap">
                           {item.valor}
                         </td>
+                        <td className="px-6 py-4 text-center text-yellow-500 font-bold whitespace-nowrap">
+                          {item.precoML || '---'}
+                        </td>
+                        <td className={`px-6 py-4 text-center font-bold whitespace-nowrap ${item.isLucro ? 'text-green-500' : 'text-red-400'}`}>
+                          {item.diferenca || '---'}
+                        </td>
+                        <td className={`px-6 py-4 text-center font-bold whitespace-nowrap ${item.isLucro ? 'text-green-500' : 'text-red-400'}`}>
+                          {item.variacao || '---'}
+                        </td>
                         <td className="px-6 py-4">
-                          <a
-                            href={item.link}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-blue-400 hover:text-blue-300 hover:underline"
-                          >
-                            Abrir
-                          </a>
+                          <div className="flex items-center justify-center gap-4">
+                            <a
+                              href={item.link}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-blue-400 hover:text-blue-300 flex items-center gap-1 font-medium transition-colors"
+                              title="Ver no Sam's"
+                            >
+                              Sam&apos;s <ExternalLink size={12}/>
+                            </a>
+                            {item.linkML && (
+                                <a
+                                  href={item.linkML}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-yellow-500 hover:text-yellow-400 flex items-center gap-1 font-medium transition-colors"
+                                  title="Ver no Mercado Livre"
+                                >
+                                  ML <ExternalLink size={12}/>
+                                </a>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     ))}
-                    {results.length === 0 && (
-                      <tr>
-                        <td colSpan={3} className="px-6 py-8 text-center text-neutral-500">
-                          Nenhum produto encontrado. Verifique a URL ou tente novamente.
-                        </td>
-                      </tr>
-                    )}
                   </tbody>
                 </table>
               </div>
             </div>
+            <p className="text-[10px] text-neutral-500 italic px-2">
+              * Diferença e variação calculadas com base no preço bruto entre as plataformas.
+            </p>
           </div>
         )}
       </div>

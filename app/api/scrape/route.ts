@@ -82,6 +82,8 @@ async function fetchFirstMercadoLivrePrice(
         'de', 'da', 'do', 'das', 'dos', 'com', 'para', 'sem', 'em', 'na', 'no', 'e', 'ou', 'a', 'o', 'as', 'os',
       ]);
       const tokens = normLower(text)
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
         .replace(/[^a-z0-9à-ÿ\s]/gi, ' ')
         .split(/\s+/)
         .map((t) => t.trim())
@@ -100,7 +102,7 @@ async function fetchFirstMercadoLivrePrice(
 
     const isOriginalPriceNode = (el: Element): boolean => {
       let cur: Element | null = el;
-      for (let i = 0; i < 4 && cur; i++) {
+      for (let i = 0; i < 6 && cur; i++) {
         const cls = ((cur as HTMLElement).className || '').toString().toLowerCase();
         if (
           cls.includes('original') ||
@@ -116,13 +118,32 @@ async function fetchFirstMercadoLivrePrice(
       return false;
     };
 
+    /** Parcelas (ex.: 5x R$ 191,70) não são preço à vista — não usar para comparação. */
+    const isInstallmentContext = (el: Element, card: Element): boolean => {
+      let cur: Element | null = el;
+      for (let i = 0; i < 10 && cur && card.contains(cur); i++) {
+        const cls = ((cur as HTMLElement).className || '').toString().toLowerCase();
+        if (
+          cls.includes('installment') ||
+          cls.includes('parcela') ||
+          cls.includes('ui-search-item__installments') ||
+          cls.includes('poly-installments')
+        ) {
+          return true;
+        }
+        cur = cur.parentElement;
+      }
+      return false;
+    };
+
     const getPriceFromCard = (card: Element): number | null => {
-      // Captura todos os preços monetários do card e prioriza preços "atuais" (não riscados)
       const amountNodes = Array.from(card.querySelectorAll('span.andes-money-amount__fraction'));
       const candidates: number[] = [];
       const backup: number[] = [];
 
       for (const node of amountNodes) {
+        if (isInstallmentContext(node, card)) continue;
+
         const frac = normalize((node as HTMLElement).innerText || node.textContent || '');
         const centsNode = node.parentElement?.querySelector('span.andes-money-amount__cents') as HTMLElement | null;
         const cents = normalize(centsNode?.innerText || centsNode?.textContent || '');
@@ -137,8 +158,22 @@ async function fetchFirstMercadoLivrePrice(
         }
       }
 
-      if (candidates.length > 0) return candidates[0];
-      if (backup.length > 0) return backup[0];
+      const pickMain = (vals: number[]): number | null => {
+        if (vals.length === 0) return null;
+        if (vals.length === 1) return vals[0];
+        const mx = Math.max(...vals);
+        const mn = Math.min(...vals);
+        // Várias linhas no card: à vista vs parcela mal detectada — prefira o maior.
+        if (mx / mn > 2.2) return mx;
+        return Math.min(...vals);
+      };
+
+      const main = pickMain(candidates);
+      if (main !== null) return main;
+
+      if (backup.length > 0) {
+        return Math.min(...backup);
+      }
 
       const aria = card.querySelector('[aria-label*="R$"], [title*="R$"]') as HTMLElement | null;
       const ariaTxt = normalize(aria?.getAttribute('aria-label') || aria?.getAttribute('title') || '');
@@ -168,19 +203,39 @@ async function fetchFirstMercadoLivrePrice(
         const price = getPriceFromCard(card);
         if (price === null) continue;
 
-        // Ignora itens internacionais
+        // Ignora itens internacionais e usados
         if (cardText.includes('internacional')) continue;
+        if (/\busado\b/.test(cardText)) continue;
 
         // Evita falsos positivos absurdos (ex.: capa de console para um console)
         const priceRatio = samsPrice > 0 ? price / samsPrice : 1;
-        if (priceRatio < 0.18) continue;
+        if (priceRatio < 0.05) continue;
 
         // Relevância textual mínima com o produto buscado
         const titleTokens = tokenSet(title || cardText);
         const rel = overlapRatio(queryTokens, titleTokens);
-        if (rel < 0.35) continue;
+        if (rel < 0.12) continue;
 
         return { price, reason: `card_${i + 1}_selected_rel_${rel.toFixed(2)}_ratio_${priceRatio.toFixed(2)}` };
+      }
+    }
+
+    // Fallback: se os filtros ficaram muito restritivos, tenta o primeiro card válido
+    // (mantém exclusões: usado/internacional e parcelas, mas sem exigir relevância forte)
+    for (const sel of cardSelectors) {
+      const cards = Array.from(document.querySelectorAll(sel));
+      if (cards.length === 0) continue;
+      const maxCards = Math.min(cards.length, 12);
+      for (let i = 0; i < maxCards; i++) {
+        const card = cards[i];
+        const cardText = normLower((card as HTMLElement).innerText || card.textContent || '');
+        if (cardText.includes('internacional')) continue;
+        if (/\busado\b/.test(cardText)) continue;
+        const price = getPriceFromCard(card);
+        if (price === null) continue;
+        const priceRatio = samsPrice > 0 ? price / samsPrice : 1;
+        if (priceRatio < 0.05) continue;
+        return { price, reason: `fallback_first_valid_${sel}_card_${i + 1}_ratio_${priceRatio.toFixed(2)}` };
       }
     }
 
@@ -608,9 +663,14 @@ export async function POST(req: Request) {
             'ml_goto',
           );
 
-          const extracted = await withTimeout(fetchFirstMercadoLivrePrice(mlPage, p.produto, samsPrice), 18000, 'ml_extract');
+          const extracted = await withTimeout(
+            fetchFirstMercadoLivrePrice(mlPage, p.produto, samsPrice),
+            18000,
+            'ml_extract',
+          );
           mlPrice = extracted.price;
           mlReason = extracted.reason;
+
           await mlPage.close().catch(() => null);
 
           if (mlReason === 'ml_requires_login') {

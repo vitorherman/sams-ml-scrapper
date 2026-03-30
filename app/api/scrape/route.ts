@@ -1,10 +1,258 @@
 import { NextResponse } from 'next/server';
 import { chromium } from 'playwright';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+
+function parseBRLToNumber(input: string): number | null {
+  if (!input) return null;
+  const m = input.match(/R\$\s*([\d\.,]+)/i);
+  const raw = (m ? m[1] : input)
+    .replace(/\s/g, '')
+    .replace(/\./g, '')
+    .replace(',', '.')
+    .replace(/[^\d.]/g, '');
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function formatBRL(value: number): string {
+  return new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(value);
+}
+
+const ML_STORAGE_STATE_PATH = path.join(process.cwd(), '.ml-storage-state.json');
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timeout(${label}) after ${ms}ms`)), ms);
+    promise
+      .then((v) => {
+        clearTimeout(timer);
+        resolve(v);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
+async function fetchFirstMercadoLivrePrice(
+  page: import('playwright').Page
+): Promise<{ price: number | null; reason: string }> {
+  // Aguarda o container de resultados (o ML alterna entre alguns layouts)
+  await page
+    .waitForSelector('li.ui-search-layout__item, ol.ui-search-layout, ul.ui-search-layout, div.ui-search-result__wrapper', {
+      timeout: 15000,
+    })
+    .catch(() => null);
+
+  const result = await page.evaluate(() => {
+    const normalize = (t: string) => t.replace(/\s+/g, ' ').replace(/\u00A0/g, ' ').trim();
+
+    const body = document.body?.innerText ? document.body.innerText.toLowerCase() : '';
+    if (body.includes('para continuar, acesse sua conta')) {
+      return { price: null, reason: 'ml_requires_login' };
+    }
+    if (body.includes('captcha') || body.includes('verificar') || body.includes('confira') || body.includes('segurança')) {
+      return { price: null, reason: 'captcha_or_verification' };
+    }
+
+    const toNumber = (txt: string): number | null => {
+      const m = normalize(txt).match(/R\$\s*([\d\.,]+)/i);
+      if (!m) return null;
+      const raw = m[1].replace(/\s/g, '').replace(/\./g, '').replace(',', '.').replace(/[^\d.]/g, '');
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    const getPriceFromCard = (card: Element): number | null => {
+      // 1) seletor mais consistente do ML: andes-money-amount fraction + cents
+      const fraction = card.querySelector('span.andes-money-amount__fraction') as HTMLElement | null;
+      if (fraction) {
+        const cents = card.querySelector('span.andes-money-amount__cents') as HTMLElement | null;
+        const fracTxt = normalize(fraction.innerText || fraction.textContent || '');
+        const centsTxt = normalize(cents?.innerText || cents?.textContent || '');
+        const composed = centsTxt ? `R$ ${fracTxt},${centsTxt}` : `R$ ${fracTxt}`;
+        const n = toNumber(composed);
+        if (n !== null) return n;
+      }
+
+      // 2) fallback: aria-label costuma conter "R$ ..."
+      const aria = card.querySelector('[aria-label*="R$"], [title*="R$"]') as HTMLElement | null;
+      const ariaTxt = normalize(aria?.getAttribute('aria-label') || aria?.getAttribute('title') || '');
+      const n2 = ariaTxt ? toNumber(ariaTxt) : null;
+      if (n2 !== null) return n2;
+
+      // 3) fallback final: varre textos curtos dentro do card
+      const texts = Array.from(card.querySelectorAll('span, div'))
+        .map((el) => normalize((el as HTMLElement).innerText || (el as HTMLElement).textContent || ''))
+        .filter((t) => t && t.length < 120);
+      for (const t of texts) {
+        const n = toNumber(t);
+        if (n !== null) return n;
+      }
+
+      // 4) fallback no texto completo do card
+      const cardText = normalize((card as HTMLElement).innerText || card.textContent || '');
+      const n3 = toNumber(cardText);
+      if (n3 !== null) return n3;
+      return null;
+    };
+
+    const cardSelectors = [
+      'li.ui-search-layout__item',
+      'div.ui-search-result__wrapper',
+      'div.ui-search-result__content-wrapper',
+      'div.ui-search-result',
+    ];
+
+    for (const sel of cardSelectors) {
+      const cards = Array.from(document.querySelectorAll(sel));
+      if (cards.length === 0) continue;
+
+      // Em headless o card pode não estar "visível" via layout; pega o primeiro do DOM.
+      const firstCard = cards[0];
+      const n = getPriceFromCard(firstCard);
+      if (n !== null) return { price: n, reason: 'card_first_price_found' };
+    }
+
+    // Se chegamos aqui, provavelmente mudou layout ou foi bloqueado
+    return { price: null, reason: 'price_not_found_layout_changed' };
+  });
+
+  const price =
+    result && typeof result.price === 'number' && Number.isFinite(result.price) ? result.price : null;
+  const reason = (result && result.reason) ? String(result.reason) : 'unknown';
+
+  return { price, reason };
+}
+
+async function fetchFirstMercadoLivrePriceByHtml(
+  query: string,
+  linkML: string,
+): Promise<{ price: number | null; reason: string }> {
+  try {
+    const url = linkML || `https://lista.mercadolivre.com.br/${encodeURIComponent(query)}_OrderId_PRICE_NoIndex_True`;
+    const res = await withTimeout(
+      fetch(url, {
+        method: 'GET',
+        headers: {
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+          'Cache-Control': 'no-cache',
+          Pragma: 'no-cache',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        },
+        cache: 'no-store',
+      }),
+      20000,
+      'ml_html_fetch',
+    );
+
+    if (!res.ok) {
+      return { price: null, reason: `ml_html_http_${res.status}` };
+    }
+
+    const html = await withTimeout(res.text(), 15000, 'ml_html_text');
+    const lower = html.toLowerCase();
+
+    if (lower.includes('para continuar, acesse sua conta')) {
+      return { price: null, reason: 'ml_requires_login' };
+    }
+    if (lower.includes('captcha') || lower.includes('verificar') || lower.includes('seguran')) {
+      return { price: null, reason: 'ml_html_captcha_or_verification' };
+    }
+
+    // 1) Tenta JSON-LD (mais estável)
+    const jsonLdBlocks = Array.from(
+      html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi),
+    )
+      .map((m) => m[1]?.trim())
+      .filter(Boolean);
+
+    for (const raw of jsonLdBlocks) {
+      try {
+        const parsed = JSON.parse(raw as string);
+        const nodes = Array.isArray(parsed) ? parsed : [parsed];
+        for (const node of nodes) {
+          if (node?.itemListElement && Array.isArray(node.itemListElement) && node.itemListElement.length > 0) {
+            const first = node.itemListElement[0];
+            const offerPrice = first?.item?.offers?.price ?? first?.offers?.price;
+            const n = typeof offerPrice === 'string' || typeof offerPrice === 'number'
+              ? Number(String(offerPrice).replace(',', '.'))
+              : NaN;
+            if (Number.isFinite(n)) {
+              return { price: n, reason: 'ml_html_jsonld_itemlist' };
+            }
+          }
+        }
+      } catch {
+        // ignora bloco JSON-LD inválido
+      }
+    }
+
+    // 2) Tenta classe de preço do card
+    const fractionMatch = html.match(/andes-money-amount__fraction[^>]*>\s*([\d\.]+)\s*</i);
+    if (fractionMatch) {
+      const fraction = Number((fractionMatch[1] || '').replace(/\./g, ''));
+      const centsMatch = html.match(/andes-money-amount__cents[^>]*>\s*(\d{1,2})\s*</i);
+      const cents = centsMatch ? Number(centsMatch[1]) : 0;
+      if (Number.isFinite(fraction) && Number.isFinite(cents)) {
+        return { price: Number((fraction + cents / 100).toFixed(2)), reason: 'ml_html_fraction_cents' };
+      }
+    }
+
+    // 3) Fallback textual: primeiro "R$ 1.234,56" do documento
+    const textual = html.match(/R\$\s*([\d\.]+,\d{2}|[\d\.]+)/i);
+    if (textual) {
+      const normalized = (textual[1] || '').replace(/\./g, '').replace(',', '.');
+      const n = Number(normalized);
+      if (Number.isFinite(n)) {
+        return { price: n, reason: 'ml_html_textual_first_price' };
+      }
+    }
+
+    return { price: null, reason: 'ml_html_price_not_found' };
+  } catch (e: any) {
+    return { price: null, reason: `ml_html_error_${e?.message || 'unknown'}` };
+  }
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let i = 0;
+
+  const workers = Array.from({ length: Math.max(1, concurrency) }, async () => {
+    while (true) {
+      const idx = i++;
+      if (idx >= items.length) return;
+      results[idx] = await mapper(items[idx], idx);
+    }
+  });
+
+  await Promise.all(workers);
+  return results;
+}
 
 export async function POST(req: Request) {
   let browser;
   try {
     const { url } = await req.json();
+    const hasMlSession = await fileExists(ML_STORAGE_STATE_PATH);
 
     if (!url) {
       return NextResponse.json({ error: 'URL is required' }, { status: 400 });
@@ -19,7 +267,14 @@ export async function POST(req: Request) {
     const context = await browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       viewport: { width: 1920, height: 1080 },
+      ...(hasMlSession ? { storageState: ML_STORAGE_STATE_PATH } : {}),
     });
+
+    if (hasMlSession) {
+      console.log(`[ML] Sessão carregada de ${ML_STORAGE_STATE_PATH}`);
+    } else {
+      console.log('[ML] Sessão não encontrada. Rode "npm run ml:login" para habilitar extração do Mercado Livre.');
+    }
 
     const page = await context.newPage();
     
@@ -180,6 +435,7 @@ export async function POST(req: Request) {
     await page.waitForTimeout(5000);
 
     // Extraction: Adicionando a lógica do link ML
+    console.log('[VTEX] Extraindo lista de produtos da página...');
     const finalProducts = await page.evaluate(() => {
       const items = document.querySelectorAll('[class*="vtex-product-summary-2-x-container"]');
       const results: any[] = [];
@@ -241,6 +497,7 @@ export async function POST(req: Request) {
 
       return results;
     });
+    console.log(`[VTEX] Produtos extraídos (com duplicados): ${finalProducts.length}`);
 
     const uniqueProductsMap = new Map();
     for (const p of finalProducts) {
@@ -249,7 +506,91 @@ export async function POST(req: Request) {
       }
     }
 
-    return NextResponse.json({ data: Array.from(uniqueProductsMap.values()), location: locationText });
+    const uniqueProducts = Array.from(uniqueProductsMap.values());
+    console.log(`[VTEX] Produtos únicos para comparar: ${uniqueProducts.length}`);
+
+    console.log(`[ML] Enriquecendo ${uniqueProducts.length} itens no Mercado Livre...`);
+    const total = uniqueProducts.length;
+    let mlBlockedByLogin = !hasMlSession;
+
+    const enriched = await mapWithConcurrency(uniqueProducts, 1, async (p, idx) => {
+      if (mlBlockedByLogin) {
+        return {
+          ...p,
+          precoML: '---',
+          diferenca: '---',
+          variacao: '---',
+          isLucro: false,
+        };
+      }
+
+      const samsPrice = parseBRLToNumber(p.valor);
+      if (!p.linkML || samsPrice === null) {
+        return { ...p, isLucro: false };
+      }
+
+      let mlPrice: number | null = null;
+      let mlReason: string | null = null;
+      const startedAt = Date.now();
+
+      console.log(`[ML] (${idx + 1}/${total}) ${p.produto}`);
+
+      try {
+        // Sem sessão válida do ML, evita desperdiçar minutos em 145 tentativas.
+        if (!hasMlSession) {
+          mlReason = 'ml_session_missing_run_npm_run_ml_login';
+        } else {
+          const mlPage = await context.newPage();
+          mlPage.setDefaultTimeout(20000);
+
+          await withTimeout(
+            mlPage.goto(p.linkML, { waitUntil: 'networkidle', timeout: 35000 }),
+            40000,
+            'ml_goto',
+          );
+
+          const extracted = await withTimeout(fetchFirstMercadoLivrePrice(mlPage), 18000, 'ml_extract');
+          mlPrice = extracted.price;
+          mlReason = extracted.reason;
+          await mlPage.close().catch(() => null);
+
+          if (mlReason === 'ml_requires_login') {
+            mlBlockedByLogin = true;
+            console.log(
+              '[ML] Sessão inválida/expirada: Mercado Livre pediu login. Rode "npm run ml:login" novamente.',
+            );
+          }
+        }
+      } catch (e) {
+        console.log('Falha ao buscar preço no ML:', p.linkML, e);
+      }
+
+      if (mlPrice === null) {
+        console.log(
+          `[ML] (${idx + 1}/${total}) SEM PRECO -> ${mlReason || 'unknown'} (elapsed ${Date.now() - startedAt}ms)`
+        );
+        return { ...p, isLucro: false };
+      }
+
+      const diff = mlPrice - samsPrice;
+      const variacao = samsPrice > 0 ? (diff / samsPrice) * 100 : null;
+
+      console.log(
+        `[ML] (${idx + 1}/${total}) OK preco=${formatBRL(mlPrice)} diff=${formatBRL(diff)} var=${
+          variacao === null ? '---' : `${variacao.toFixed(2)}%`
+        } reason=${mlReason || 'unknown'} (elapsed ${Date.now() - startedAt}ms)`
+      );
+
+      return {
+        ...p,
+        precoML: formatBRL(mlPrice),
+        diferenca: formatBRL(diff),
+        variacao: variacao === null ? '---' : `${variacao.toFixed(2)}%`,
+        isLucro: diff > 0,
+      };
+    });
+
+    return NextResponse.json({ data: enriched, location: locationText });
   } catch (error: any) {
     console.error('Scraping error:', error);
     return NextResponse.json({ error: error.message || 'Failed to scrape data' }, { status: 500 });

@@ -150,7 +150,17 @@ export default function Home() {
                   </thead>
                   <tbody className="divide-y divide-neutral-800">
                     {results.map((item, index) => (
-                      <tr key={index} className="hover:bg-neutral-800/50 transition-colors">
+                      <tr
+                        key={index}
+                        className={[
+                          'transition-colors',
+                          item.diferenca && item.diferenca !== '---'
+                            ? item.isLucro
+                              ? 'bg-green-900/10 hover:bg-green-900/20'
+                              : 'bg-red-900/10 hover:bg-red-900/20'
+                            : 'hover:bg-neutral-800/50',
+                        ].join(' ')}
+                      >
                         <td className="px-6 py-4 font-medium text-neutral-200">
                           {item.produto}
                         </td>
